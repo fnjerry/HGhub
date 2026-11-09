@@ -6,8 +6,11 @@ name: Sync upstream fork
 # Settings > Actions > General > Workflow permissions.
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'
+  # Disabled: the built-in GITHUB_TOKEN cannot manage Releases on a fork
+  # (403 "Resource not accessible by integration"). To automate again, add a
+  # SYNC_TOKEN repository secret (classic PAT with repo scope) and uncomment.
+  # schedule:
+  #   - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -30,7 +33,7 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
       DRY_RUN: ${{ inputs.dry_run || 'false' }}
     steps:
       - name: Checkout fork
