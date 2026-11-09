@@ -39,29 +39,13 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Sync tags and default branch
+      - name: Fetch upstream tags
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git remote add upstream "https://github.com/$UPSTREAM.git" 2>/dev/null || true
           git fetch upstream --tags --prune
-          if [ "$DRY_RUN" = 'true' ]; then exit 0; fi
-          work="$(mktemp -d)"
-          gh api --paginate "repos/$GITHUB_REPOSITORY/tags?per_page=100" \
-            --jq '.[].name' | sort -u > "$work/have-tags.txt"
-          for tag in $(git tag --list); do
-            if ! grep -Fxq "$tag" "$work/have-tags.txt"; then
-              sha=$(git rev-parse "$tag^{commit}")
-              gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
-                -f ref="refs/tags/$tag" -f sha="$sha" > /dev/null \
-                || echo "::warning::could not create tag $tag"
-            fi
-          done
-          sha=$(git rev-parse "upstream/$UPSTREAM_BRANCH")
-          gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$UPSTREAM_BRANCH" \
-            -f sha="$sha" -F force=false > /dev/null \
-            || echo "::warning::branch is not fast-forward, skipped"
 
       - name: Sync releases and assets
         run: |
@@ -96,7 +80,9 @@ jobs:
                   || echo "::warning::asset download failed: $name"
               done < "$work/assets.tsv"
             fi
-            args=("$tag" -R "$GITHUB_REPOSITORY" --verify-tag --title "$title" --notes-file "$notes")
+            sha=$(git rev-parse "$tag^{commit}" 2>/dev/null || true)
+            if [ -z "$sha" ]; then sha=$(git rev-parse "upstream/$UPSTREAM_BRANCH"); fi
+            args=("$tag" -R "$GITHUB_REPOSITORY" --target "$sha" --title "$title" --notes-file "$notes")
             if [ "$pre" = 'true' ]; then args+=(--prerelease); fi
             if [ "$draft" = 'true' ]; then args+=(--draft); fi
             mapfile -t files < <(find "$dir" -maxdepth 1 -type f)
