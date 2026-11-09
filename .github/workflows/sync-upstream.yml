@@ -1,0 +1,103 @@
+name: Sync upstream fork
+
+# Put this file in YOUR FORK at .github/workflows/sync-upstream.yml
+# UPSTREAM is preset to Minireel/HGhub (default branch: main).
+# Enable "Read and write permissions" in
+# Settings > Actions > General > Workflow permissions.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only report missing releases, do not write'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: 'Minireel/HGhub'
+  UPSTREAM_BRANCH: 'main'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DRY_RUN: ${{ inputs.dry_run || 'false' }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Sync tags and default branch
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "https://github.com/$UPSTREAM.git" 2>/dev/null || true
+          git fetch upstream --tags --prune
+          if [ "$DRY_RUN" = 'true' ]; then exit 0; fi
+          git push origin --tags || echo "::warning::tag push failed, check for tag conflicts"
+          sha=$(git rev-parse "upstream/$UPSTREAM_BRANCH")
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$UPSTREAM_BRANCH" \
+            -f sha="$sha" -F force=false > /dev/null \
+            || echo "::warning::branch is not fast-forward, skipped"
+
+      - name: Sync releases and assets
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          gh api --paginate "repos/$UPSTREAM/releases?per_page=100" \
+            --jq '.[] | [.tag_name, (.name // .tag_name), (.draft|tostring), (.prerelease|tostring), (.body // "" | @base64)] | @tsv' \
+            > "$work/list.tsv"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[].tag_name' | sort -u > "$work/have.txt"
+
+          new=0; i=0; present=0
+          while IFS=$'\t' read -r tag title draft pre b64; do
+            if [ -z "$tag" ]; then continue; fi
+            if grep -Fxq "$tag" "$work/have.txt"; then
+              present=$((present+1)); continue
+            fi
+            if [ "$DRY_RUN" = 'true' ]; then
+              echo "missing: $tag"; new=$((new+1)); continue
+            fi
+            i=$((i+1))
+            notes="$work/notes-$i.md"; dir="$work/assets-$i"; mkdir -p "$dir"
+            printf '%s' "$b64" | base64 -d > "$notes"
+            if ! gh release download "$tag" -R "$UPSTREAM" -D "$dir" --clobber; then
+              gh api "repos/$UPSTREAM/releases?per_page=100" \
+                --jq ".[] | select(.tag_name == \"$tag\") | .assets[] | [.name, .url] | @tsv" \
+                > "$work/assets.tsv" || true
+              while IFS=$'\t' read -r name url; do
+                if [ -z "$name" ]; then continue; fi
+                curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                  -H 'Accept: application/octet-stream' "$url" -o "$dir/$name" \
+                  || echo "::warning::asset download failed: $name"
+              done < "$work/assets.tsv"
+            fi
+            args=("$tag" -R "$GITHUB_REPOSITORY" --verify-tag --title "$title" --notes-file "$notes")
+            if [ "$pre" = 'true' ]; then args+=(--prerelease); fi
+            if [ "$draft" = 'true' ]; then args+=(--draft); fi
+            mapfile -t files < <(find "$dir" -maxdepth 1 -type f)
+            gh release create "${args[@]}" "${files[@]}"
+            echo "synced: $tag"; new=$((new+1))
+          done < "$work/list.tsv"
+
+          {
+            echo "### Upstream sync"
+            echo "- upstream: $UPSTREAM"
+            echo "- new releases: $new"
+            echo "- already present: $present"
+            echo "- dry run: $DRY_RUN"
+          } >> "$GITHUB_STEP_SUMMARY"
