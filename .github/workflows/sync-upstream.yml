@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: write
+  workflows: write
 
 concurrency:
   group: sync-upstream-${{ github.ref }}
@@ -47,7 +48,17 @@ jobs:
           git remote add upstream "https://github.com/$UPSTREAM.git" 2>/dev/null || true
           git fetch upstream --tags --prune
           if [ "$DRY_RUN" = 'true' ]; then exit 0; fi
-          git push origin --tags || echo "::warning::tag push failed, check for tag conflicts"
+          work="$(mktemp -d)"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/tags?per_page=100" \
+            --jq '.[].name' | sort -u > "$work/have-tags.txt"
+          for tag in $(git tag --list); do
+            if ! grep -Fxq "$tag" "$work/have-tags.txt"; then
+              sha=$(git rev-parse "$tag^{commit}")
+              gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+                -f ref="refs/tags/$tag" -f sha="$sha" > /dev/null \
+                || echo "::warning::could not create tag $tag"
+            fi
+          done
           sha=$(git rev-parse "upstream/$UPSTREAM_BRANCH")
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$UPSTREAM_BRANCH" \
             -f sha="$sha" -F force=false > /dev/null \
